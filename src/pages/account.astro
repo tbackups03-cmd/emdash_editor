@@ -1,0 +1,836 @@
+---
+import {
+	getEmDashCollection,
+	getTaxonomyTermsWithCacheHint,
+	getTermsForEntries,
+} from "emdash";
+import Base from "../layouts/Base.astro";
+import { getCurrentMember, getDB } from "../lib/member-auth";
+import { formatDate } from "../utils/locale";
+
+const member = await getCurrentMember(Astro.cookies);
+if (!member) {
+	return Astro.redirect("/login?redirect=%2Faccount");
+}
+
+interface MemberGrantRow {
+	id: string;
+	grant_type: "book" | "all_access";
+	target_slug: string;
+	source?: string;
+	stripe_ref_id?: string | null;
+	expires_at?: string | null;
+	created_at?: string;
+}
+
+interface BookshelfItem {
+	slug: string;
+	title: string;
+	chapterCount: number;
+	firstChapterSlug: string | null;
+	firstChapterTitle: string | null;
+	accessLabel: string;
+	expiryLabel: string;
+}
+
+let allAccessGrant: MemberGrantRow | null = null;
+let hasStripeHistory = false;
+let monthlyPriceThb = 0;
+let bookshelf: BookshelfItem[] = [];
+let loadError = "";
+
+try {
+	const db = getDB();
+	const nowIso = new Date().toISOString();
+
+	// 1. ดึงรายการสิทธิ์ทั้งหมดของสมาชิก (ใช้ SELECT * เพื่อป้องกันปัญหาชื่อคอลัมน์ไม่ตรง)
+	const grantsResult = await db
+		.prepare(
+			`SELECT * FROM app_member_grants
+			 WHERE member_id = ? AND (expires_at IS NULL OR expires_at > ?)
+			 ORDER BY created_at DESC`,
+		)
+		.bind(member.id, nowIso)
+		.all<MemberGrantRow>();
+
+	const activeGrants = grantsResult.results ?? [];
+	allAccessGrant = activeGrants.find((g) => g.grant_type === "all_access") ?? null;
+	const bookGrants = activeGrants.filter((g) => g.grant_type === "book");
+	hasStripeHistory = activeGrants.some((g) => Boolean(g.stripe_ref_id));
+
+	// 2. ดึงราคาแพ็กเกจและชื่อหนังสือ
+	const productsResult = await db
+		.prepare("SELECT category_slug, title, price_thb FROM app_book_products")
+		.all<{ category_slug: string; title: string; price_thb: number }>();
+
+	const productMap = new Map<string, { title: string; price_thb: number }>();
+	for (const row of productsResult.results ?? []) {
+		if (row.category_slug === "__subscription__") {
+			monthlyPriceThb = row.price_thb;
+		} else {
+			productMap.set(row.category_slug, {
+				title: row.title,
+				price_thb: row.price_thb,
+			});
+		}
+	}
+
+	// 3. ดึงหมวดหมู่และบทเรียนทั้งหมด
+	const categoriesResult = await getTaxonomyTermsWithCacheHint("category", {
+		includeCounts: true,
+	});
+	const allCategories = categoriesResult.data ?? [];
+
+	const { entries: allPosts } = await getEmDashCollection("posts", {
+		orderBy: { published_at: "desc" },
+		limit: 500,
+	});
+
+	const categoriesByPostId =
+		allPosts.length > 0
+			? await getTermsForEntries(
+					"posts",
+					allPosts.map((p) => p.data.id),
+					"category",
+				)
+			: new Map<string, Array<{ slug: string; label: string }>>();
+
+	const ownedCategorySlugs = new Set<string>();
+	if (allAccessGrant) {
+		for (const cat of allCategories) {
+			ownedCategorySlugs.add(cat.slug);
+		}
+	} else {
+		for (const g of bookGrants) {
+			ownedCategorySlugs.add(g.target_slug);
+		}
+	}
+
+	for (const catSlug of ownedCategorySlugs) {
+		const catMeta = allCategories.find((c) => c.slug === catSlug);
+		const prodMeta = productMap.get(catSlug);
+		const bookTitle = prodMeta?.title || catMeta?.label || catSlug;
+
+		const chapters = allPosts
+			.filter((p) => {
+				const cats = categoriesByPostId.get(p.data.id) ?? [];
+				return cats.some((c) => c.slug === catSlug);
+			})
+			.map((p) => ({
+				slug: String(p.id),
+				title: String(p.data.title ?? "ไม่มีชื่อบท"),
+				publishedTime: p.data.publishedAt ? new Date(String(p.data.publishedAt)).getTime() : 0,
+			}))
+			.sort((a, b) => {
+				if (a.publishedTime !== b.publishedTime) return a.publishedTime - b.publishedTime;
+				return a.title.localeCompare(b.title, "th", { numeric: true });
+			});
+
+		const matchingBookGrant = bookGrants.find((g) => g.target_slug === catSlug);
+
+		let accessLabel = "สมาชิกรายเดือน";
+		let expiryLabel = "ใช้งานได้ตามรอบสมาชิก";
+
+		if (matchingBookGrant) {
+			accessLabel =
+				matchingBookGrant.source === "admin_manual" ? "สิทธิ์พิเศษจากผู้ดูแล" : "ซื้อขาดรายเล่ม";
+			expiryLabel = matchingBookGrant.expires_at
+				? `หมดอายุ ${formatDate(new Date(matchingBookGrant.expires_at), "long")}`
+				: "อ่านได้ตลอดชีพ (ไม่มีวันหมดอายุ)";
+		} else if (allAccessGrant) {
+			expiryLabel = allAccessGrant.expires_at
+				? `ถึงวันที่ ${formatDate(new Date(allAccessGrant.expires_at), "long")}`
+				: "ไม่จำกัดระยะเวลา";
+		}
+
+		bookshelf.push({
+			slug: catSlug,
+			title: bookTitle,
+			chapterCount: chapters.length,
+			firstChapterSlug: chapters[0]?.slug ?? null,
+			firstChapterTitle: chapters[0]?.title ?? null,
+			accessLabel,
+			expiryLabel,
+		});
+	}
+} catch (err) {
+	loadError = err instanceof Error ? err.message : "เกิดข้อผิดพลาดในการโหลดข้อมูลบัญชี";
+}
+
+function formatSourceLabel(source?: string): string {
+	switch (source) {
+		case "stripe_subscription":
+			return "ชำระเงินอัตโนมัติผ่าน Stripe";
+		case "stripe_onetime":
+			return "ชำระเงินครั้งเดียวผ่าน Stripe";
+		case "admin_manual":
+			return "เปิดสิทธิ์โดยผู้ดูแลระบบ";
+		default:
+			return source || "สมาชิก";
+	}
+}
+---
+
+<Base
+	title="ชั้นหนังสือและบัญชีของฉัน"
+	description="จัดการบัญชีสมาชิก ตรวจสอบสถานะการชำระเงิน และเปิดอ่านหนังสือของคุณ"
+>
+	<div class="band section">
+		<div class="frame account-page">
+			<header class="account-header">
+				<div>
+					<p class="eyebrow">บัญชีสมาชิก</p>
+					<h1 class="account-header__title">สวัสดีคุณ {member.display_name}</h1>
+					<p class="account-header__sub">
+						{member.email} · รหัสสมาชิก <code>{member.id.slice(0, 8)}</code>
+					</p>
+				</div>
+
+				<div class="account-header__actions">
+					<a href="/posts" class="btn btn--ghost btn--sm">เลือกดูหนังสือทั้งหมด</a>
+					<form method="post" action="/api/member/logout" style="margin: 0;">
+						<button type="submit" class="btn btn--ghost btn--sm">ออกจากระบบ</button>
+					</form>
+				</div>
+			</header>
+
+			{
+				loadError && (
+					<div style="padding: 14px 18px; border-radius: 12px; background: rgb(220 38 38 / 0.12); border: 1px solid rgb(220 38 38 / 0.35); color: #dc2626; font-size: 0.9rem;">
+						<strong>พบข้อผิดพลาดในการดึงข้อมูล:</strong> {loadError}
+					</div>
+				)
+			}
+
+			<section class="account-card" aria-labelledby="membership-status-title">
+				<div class="account-card__head">
+					<div>
+						<h2 id="membership-status-title" class="account-card__title">
+							สถานะสมาชิกและการชำระเงิน
+						</h2>
+						<p class="account-card__desc">
+							ตรวจสอบแพ็กเกจปัจจุบัน จัดการบัตรเครดิต หรือยกเลิกการต่ออายุอัตโนมัติ
+						</p>
+					</div>
+
+					{
+						hasStripeHistory && (
+							<button type="button" class="btn btn--sm" data-open-portal>
+								จัดการบิล / ยกเลิกรายเดือน
+							</button>
+						)
+					}
+				</div>
+
+				{
+					allAccessGrant ? (
+						<div class="status-banner status-banner--active">
+							<div class="status-banner__badge">✓ สมาชิกเต็มรูปแบบ (อ่านได้ทุกเล่ม)</div>
+							<p class="status-banner__text">
+								คุณสามารถเปิดอ่านหนังสือและบทความพิเศษได้ทุกเล่มไม่จำกัด
+							</p>
+							<p class="status-banner__meta">
+								<span>รูปแบบ: {formatSourceLabel(allAccessGrant.source)}</span>
+								{allAccessGrant.expires_at && (
+									<span>
+										· รอบสิทธิ์ใช้งานถึงวันที่{" "}
+										<strong>{formatDate(new Date(allAccessGrant.expires_at), "long")}</strong>
+									</span>
+								)}
+							</p>
+						</div>
+					) : (
+						<div class="status-banner">
+							<div class="status-banner__badge">บัญชีสมาชิกทั่วไป (ปลดล็อกเฉพาะเล่มที่ซื้อ)</div>
+							<p class="status-banner__text">
+								{monthlyPriceThb > 0
+									? `สมัครสมาชิกรายเดือนเพียง ${monthlyPriceThb.toLocaleString()} บาท/เดือน เพื่อปลดล็อกหนังสือทุกเล่มในเว็บไซต์`
+									: "คุณสามารถเลือกซื้อขาดเป็นรายเล่ม หรืออัปเกรดเป็นสมาชิกรายเดือนได้จากหน้าบทความ"}
+							</p>
+						</div>
+					)
+				}
+			</section>
+
+			<section class="account-section" aria-labelledby="my-bookshelf-title">
+				<div class="account-section__head">
+					<h2 id="my-bookshelf-title" class="account-section__title">
+						ชั้นหนังสือของฉัน ({bookshelf.length} เล่ม)
+					</h2>
+				</div>
+
+				{
+					bookshelf.length > 0 ? (
+						<div class="bookshelf-grid">
+							{bookshelf.map((book) => (
+								<article class="book-item" data-book-card data-book-slug={book.slug}>
+									<div class="book-item__top">
+										<span class="book-item__badge">{book.accessLabel}</span>
+										<span class="book-item__count">{book.chapterCount} บท</span>
+									</div>
+
+									<h3 class="book-item__title">
+										<a href={`/category/${book.slug}`}>{book.title}</a>
+									</h3>
+
+									<p class="book-item__expiry">{book.expiryLabel}</p>
+
+									{book.firstChapterTitle && (
+										<p class="book-item__chapter" data-default-chapter>
+											เริ่มต้นที่: <span>{book.firstChapterTitle}</span>
+										</p>
+									)}
+
+									<div class="book-progress" data-book-progress hidden>
+										<div class="book-progress__meta">
+											<span class="book-progress__label" data-progress-label>กำลังอ่าน</span>
+											<strong class="book-progress__pct" data-progress-pct>0%</strong>
+										</div>
+										<div class="book-progress__bar">
+											<div class="book-progress__fill" data-progress-fill style="width: 0%;"></div>
+										</div>
+									</div>
+
+									<div class="book-item__actions">
+										{book.firstChapterSlug ? (
+											<a
+												href={`/posts/${book.firstChapterSlug}`}
+												class="btn btn--sm"
+												data-book-primary-btn
+											>
+												เริ่มอ่านบทที่ 1
+											</a>
+										) : (
+											<a
+												href={`/category/${book.slug}`}
+												class="btn btn--sm"
+												data-book-primary-btn
+											>
+												เปิดดูหนังสือ
+											</a>
+										)}
+										<a href={`/category/${book.slug}`} class="btn btn--ghost btn--sm">
+											สารบัญทั้งหมด
+										</a>
+									</div>
+								</article>
+							))}
+						</div>
+					) : (
+						<div class="empty-shelf">
+							<p class="empty-shelf__title">ยังไม่มีหนังสือในชั้นของคุณ</p>
+							<p class="empty-shelf__desc">
+								เมื่อคุณสั่งซื้อหนังสือรายเล่ม หรือสมัครแพ็กเกจสมาชิกรายเดือน หนังสือทั้งหมดจะมาปรากฏที่นี่เพื่อให้กดกลับมาอ่านได้ทันที
+							</p>
+							<a href="/posts" class="btn">
+								เลือกดูหนังสือและบทความ
+							</a>
+						</div>
+					)
+				}
+			</section>
+			<!-- ส่วนที่ 3: เปลี่ยนรหัสผ่าน -->
+			<section class="account-card" aria-labelledby="change-password-title">
+				<div class="account-card__head">
+					<div>
+						<h2 id="change-password-title" class="account-card__title">
+							ความปลอดภัยและรหัสผ่าน
+						</h2>
+						<p class="account-card__desc">
+							เปลี่ยนรหัสผ่านสำหรับเข้าสู่ระบบบัญชีสมาชิกของคุณ
+						</p>
+					</div>
+				</div>
+
+				<form id="change-password-form" style="display: grid; gap: 12px; margin-top: 16px; max-width: 420px;">
+					<div style="display: grid; gap: 4px;">
+						<label for="current_password" style="font-size: var(--font-size-xs); font-weight: 500;">
+							รหัสผ่านปัจจุบัน
+						</label>
+						<input
+							id="current_password"
+							name="current_password"
+							type="password"
+							required
+							style="width: 100%; box-sizing: border-box; height: 2.5rem; padding-inline: 12px; border: 1px solid var(--color-border); border-radius: var(--radius); background: var(--color-bg); color: var(--color-text); font: inherit;"
+						/>
+					</div>
+
+					<div style="display: grid; gap: 4px;">
+						<label for="new_password" style="font-size: var(--font-size-xs); font-weight: 500;">
+							รหัสผ่านใหม่ (อย่างน้อย 6 ตัวอักษร)
+						</label>
+						<input
+							id="new_password"
+							name="new_password"
+							type="password"
+							required
+							minlength="6"
+							style="width: 100%; box-sizing: border-box; height: 2.5rem; padding-inline: 12px; border: 1px solid var(--color-border); border-radius: var(--radius); background: var(--color-bg); color: var(--color-text); font: inherit;"
+						/>
+					</div>
+
+					<div style="display: grid; gap: 4px;">
+						<label for="confirm_new_password" style="font-size: var(--font-size-xs); font-weight: 500;">
+							ยืนยันรหัสผ่านใหม่
+						</label>
+						<input
+							id="confirm_new_password"
+							name="confirm_new_password"
+							type="password"
+							required
+							minlength="6"
+							style="width: 100%; box-sizing: border-box; height: 2.5rem; padding-inline: 12px; border: 1px solid var(--color-border); border-radius: var(--radius); background: var(--color-bg); color: var(--color-text); font: inherit;"
+						/>
+					</div>
+
+					<p id="pw-msg" style="font-size: var(--font-size-xs);" hidden></p>
+
+					<div>
+						<button type="submit" id="pw-submit-btn" class="btn btn--sm">
+							บันทึกรหัสผ่านใหม่
+						</button>
+					</div>
+				</form>
+			</section>
+		</div>
+	</div>
+
+	<script>
+		const portalBtn = document.querySelector("[data-open-portal]");
+		if (portalBtn instanceof HTMLButtonElement) {
+			portalBtn.addEventListener("click", async () => {
+				const originalText = portalBtn.textContent;
+				portalBtn.disabled = true;
+				portalBtn.textContent = "กำลังเปิดหน้าจัดการบิล...";
+
+				try {
+					const res = await fetch("/api/stripe/portal", { method: "POST" });
+					const data = await res.json();
+					if (!res.ok || !data.url) {
+						alert(data.error || "ไม่สามารถเปิดหน้าจัดการการชำระเงินได้");
+						portalBtn.disabled = false;
+						portalBtn.textContent = originalText;
+						return;
+					}
+					window.location.href = data.url;
+				} catch {
+					alert("เกิดข้อผิดพลาดในการเชื่อมต่อเซิร์ฟเวอร์");
+					portalBtn.disabled = false;
+					portalBtn.textContent = originalText;
+				}
+			});
+		}
+		// แสดงความคืบหน้าการอ่านและอัปเดตปุ่ม "อ่านต่อ" บนชั้นหนังสือ
+		document.querySelectorAll("[data-book-card]").forEach((card) => {
+			if (!(card instanceof HTMLElement)) return;
+			const slug = card.dataset.bookSlug;
+			if (!slug) return;
+
+			try {
+				const raw = localStorage.getItem(`ebook-progress:${slug}`);
+				if (!raw) return;
+				const saved = JSON.parse(raw);
+				if (!saved || !saved.chapterSlug || typeof saved.percent !== "number") return;
+
+				const progressWrap = card.querySelector("[data-book-progress]");
+				const labelEl = card.querySelector("[data-progress-label]");
+				const pctEl = card.querySelector("[data-progress-pct]");
+				const fillEl = card.querySelector("[data-progress-fill]");
+				const primaryBtn = card.querySelector("[data-book-primary-btn]");
+				const defaultChapterEl = card.querySelector("[data-default-chapter]");
+
+				if (progressWrap instanceof HTMLElement) progressWrap.hidden = false;
+				if (defaultChapterEl instanceof HTMLElement) defaultChapterEl.hidden = true;
+				if (labelEl) labelEl.textContent = `อ่านค้างไว้: ${saved.chapterTitle || "บทล่าสุด"}`;
+				if (pctEl) pctEl.textContent = `${saved.percent}%`;
+				if (fillEl instanceof HTMLElement) fillEl.style.width = `${saved.percent}%`;
+
+				if (primaryBtn instanceof HTMLAnchorElement) {
+					primaryBtn.href = `/posts/${saved.chapterSlug}`;
+					primaryBtn.textContent =
+						saved.percent >= 95 ? "อ่านซ้ำบทล่าสุด" : `อ่านต่อ (${saved.percent}%)`;
+				}
+			} catch {}
+		});
+		// ระบบเปลี่ยนรหัสผ่านในหน้าบัญชีสมาชิก
+		const pwForm = document.getElementById("change-password-form");
+		const pwMsg = document.getElementById("pw-msg");
+		const pwBtn = document.getElementById("pw-submit-btn");
+
+		if (pwForm instanceof HTMLFormElement && pwMsg instanceof HTMLElement && pwBtn instanceof HTMLButtonElement) {
+			pwForm.addEventListener("submit", async (e) => {
+				e.preventDefault();
+				pwMsg.hidden = true;
+
+				const fd = new FormData(pwForm);
+				const currentPassword = String(fd.get("current_password") ?? "");
+				const newPassword = String(fd.get("new_password") ?? "");
+				const confirmPassword = String(fd.get("confirm_new_password") ?? "");
+
+				if (newPassword !== confirmPassword) {
+					pwMsg.style.color = "#ef4444";
+					pwMsg.textContent = "รหัสผ่านใหม่ทั้งสองช่องไม่ตรงกัน";
+					pwMsg.hidden = false;
+					return;
+				}
+
+				pwBtn.disabled = true;
+				pwBtn.textContent = "กำลังบันทึก...";
+
+				try {
+					const res = await fetch("/api/member/change-password", {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({
+							current_password: currentPassword,
+							new_password: newPassword,
+						}),
+					});
+					const data = await res.json();
+
+					if (!res.ok) {
+						pwMsg.style.color = "#ef4444";
+						pwMsg.textContent = data.error || "เปลี่ยนรหัสผ่านไม่สำเร็จ";
+						pwMsg.hidden = false;
+					} else {
+						pwMsg.style.color = "#16a34a";
+						pwMsg.textContent = "เปลี่ยนรหัสผ่านใหม่เรียบร้อยแล้ว ✓";
+						pwMsg.hidden = false;
+						pwForm.reset();
+					}
+				} catch {
+					pwMsg.style.color = "#ef4444";
+					pwMsg.textContent = "เกิดข้อผิดพลาดในการเชื่อมต่อเซิร์ฟเวอร์";
+					pwMsg.hidden = false;
+				} finally {
+					pwBtn.disabled = false;
+					pwBtn.textContent = "บันทึกรหัสผ่านใหม่";
+				}
+			});
+		}
+	</script>
+</Base>
+
+<style>
+	.account-page {
+		width: 100%;
+		max-width: 56rem;
+		min-width: 0;
+		margin-inline: auto;
+		display: grid;
+		grid-template-columns: minmax(0, 1fr);
+		gap: var(--spacing-8);
+	}
+
+	.account-header {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: flex-end;
+		justify-content: space-between;
+		gap: var(--spacing-4);
+		min-width: 0;
+		padding-block-end: var(--spacing-6);
+		border-block-end: 1px solid var(--color-border);
+	}
+
+	.account-header__title {
+		margin-top: var(--spacing-2);
+		font-size: clamp(1.5rem, 1.2rem + 1.2vw, 2rem);
+		overflow-wrap: break-word;
+	}
+
+	.account-header__sub {
+		margin-top: var(--spacing-1);
+		font-size: var(--font-size-sm);
+		color: var(--color-text-secondary);
+		overflow-wrap: anywhere;
+	}
+
+	.account-header__sub code {
+		padding: 2px 6px;
+		border-radius: 6px;
+		background: var(--color-fill);
+		font-family: var(--font-mono);
+		font-size: var(--font-size-xs);
+	}
+
+	.account-header__actions {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--spacing-2);
+	}
+
+	.account-card {
+		width: 100%;
+		max-width: 100%;
+		min-width: 0;
+		box-sizing: border-box;
+		padding: clamp(1.1rem, 3vw, 1.75rem);
+		border: 1px solid var(--color-border);
+		border-radius: 18px;
+		background: var(--color-surface);
+		box-shadow: var(--shadow-card);
+	}
+
+	.account-card__head {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: var(--spacing-4);
+		min-width: 0;
+	}
+
+	.account-card__head > div {
+		flex: 1 1 220px;
+		min-width: 0;
+	}
+
+	.account-card__title {
+		font-size: var(--font-size-lg);
+		overflow-wrap: break-word;
+	}
+
+	.account-card__desc {
+		margin-top: 4px;
+		font-size: var(--font-size-sm);
+		color: var(--color-text-secondary);
+		overflow-wrap: break-word;
+	}
+
+	.status-banner {
+		width: 100%;
+		max-width: 100%;
+		min-width: 0;
+		box-sizing: border-box;
+		margin-top: var(--spacing-5);
+		padding: var(--spacing-4);
+		border: 1px solid var(--color-border);
+		border-radius: 14px;
+		background: var(--color-bg);
+		overflow-wrap: break-word;
+	}
+
+	.status-banner--active {
+		border-color: rgb(22 163 74 / 0.35);
+		background: rgb(22 163 74 / 0.08);
+	}
+
+	.status-banner__badge {
+		display: inline-block;
+		font-size: var(--font-size-xs);
+		font-weight: 700;
+		color: var(--color-brand);
+	}
+
+	.status-banner--active .status-banner__badge {
+		color: #16a34a;
+	}
+
+	.status-banner__text {
+		margin-top: 6px;
+		font-size: var(--font-size-sm);
+		color: var(--color-text);
+	}
+
+	.status-banner__meta {
+		margin-top: 6px;
+		font-size: var(--font-size-xs);
+		color: var(--color-text-secondary);
+	}
+
+	.account-section {
+		width: 100%;
+		max-width: 100%;
+		min-width: 0;
+	}
+
+	.account-section__head {
+		margin-block-end: var(--spacing-4);
+	}
+
+	.account-section__title {
+		font-size: var(--font-size-xl);
+	}
+
+	.bookshelf-grid {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr);
+		gap: var(--spacing-4);
+		min-width: 0;
+	}
+
+	@media (min-width: 640px) {
+		.bookshelf-grid {
+			grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
+		}
+	}
+
+	.book-item {
+		display: flex;
+		flex-direction: column;
+		gap: var(--spacing-3);
+		width: 100%;
+		max-width: 100%;
+		min-width: 0;
+		box-sizing: border-box;
+		padding: var(--spacing-5);
+		border: 1px solid var(--color-border);
+		border-radius: 16px;
+		background: var(--color-surface);
+		box-shadow: var(--shadow-card);
+	}
+
+	.book-item__top {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--spacing-2);
+		min-width: 0;
+	}
+
+	.book-item__badge {
+		padding: 3px 10px;
+		border-radius: var(--radius-full);
+		background: var(--color-fill-strong);
+		color: var(--color-brand);
+		font-size: 11px;
+		font-weight: 600;
+	}
+
+	.book-item__count {
+		font-family: var(--font-mono);
+		font-size: var(--font-size-xs);
+		color: var(--color-muted);
+		flex-shrink: 0;
+	}
+
+	.book-item__title {
+		font-size: var(--font-size-lg);
+		line-height: 1.35;
+		min-width: 0;
+		overflow-wrap: break-word;
+	}
+
+	.book-item__title a {
+		color: var(--color-text);
+		text-decoration: none;
+	}
+
+	.book-item__title a:hover {
+		color: var(--color-brand);
+	}
+
+	.book-item__expiry {
+		font-size: var(--font-size-xs);
+		color: var(--color-text-secondary);
+		overflow-wrap: break-word;
+	}
+
+	.book-item__chapter {
+		font-size: var(--font-size-xs);
+		color: var(--color-muted);
+		min-width: 0;
+		overflow-wrap: break-word;
+	}
+
+	.book-item__chapter span {
+		color: var(--color-text-secondary);
+	}
+
+	.book-item__actions {
+		margin-top: auto;
+		padding-top: var(--spacing-2);
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--spacing-2);
+	}
+
+	.empty-shelf {
+		width: 100%;
+		max-width: 100%;
+		min-width: 0;
+		box-sizing: border-box;
+		padding: clamp(2rem, 5vw, 3rem);
+		border: 1px dashed var(--color-border-strong);
+		border-radius: 18px;
+		background: var(--color-surface);
+		text-align: center;
+	}
+
+	.empty-shelf__title {
+		font-size: var(--font-size-lg);
+		font-weight: 600;
+	}
+
+	.empty-shelf__desc {
+		max-width: 46ch;
+		margin-inline: auto;
+		margin-block: var(--spacing-2) var(--spacing-5);
+		font-size: var(--font-size-sm);
+		color: var(--color-text-secondary);
+	}
+
+	/* แถบความคืบหน้าการอ่าน (ล็อกความกว้างไม่ให้ดันทะลุการ์ด) */
+	.book-progress {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		width: 100%;
+		max-width: 100%;
+		min-width: 0;
+		box-sizing: border-box;
+		padding: 10px 12px;
+		border-radius: 10px;
+		background: var(--color-bg);
+		border: 1px solid var(--color-border);
+	}
+
+	.book-progress[hidden] {
+		display: none;
+	}
+
+	.book-progress__meta {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 8px;
+		width: 100%;
+		min-width: 0;
+		font-size: 11px;
+	}
+
+	.book-progress__label {
+		flex: 1 1 auto;
+		min-width: 0;
+		color: var(--color-text-secondary);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.book-progress__pct {
+		flex: 0 0 auto;
+		color: var(--color-brand);
+		font-family: var(--font-mono);
+	}
+
+	.book-progress__bar {
+		width: 100%;
+		min-width: 0;
+		height: 6px;
+		border-radius: var(--radius-full);
+		background: var(--color-fill-strong);
+		overflow: hidden;
+	}
+
+	.book-progress__fill {
+		height: 100%;
+		max-width: 100%;
+		border-radius: var(--radius-full);
+		background: var(--color-brand);
+		transition: width 0.3s ease;
+	}
+</style>

@@ -1,0 +1,1 @@
+ALTER TABLE app_book_products ADD COLUMN preview_paragraphs INTEGER NOT NULL DEFAULT 2;

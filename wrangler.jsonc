@@ -1,0 +1,30 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "sptblog2", //ชื่อนี้จะเป็นส่วนหนึ่งของ URL เริ่มต้นที่ Cloudflare สร้างให้ (เช่น spt-blog.<บัญชีคุณ>.workers.dev) แก้ไขได้อิสระเลย
+	"main": "./src/worker.ts", //ห้ามแก้
+	"compatibility_date": "2026-02-24", //แนะนำให้ใช้วันที่ล่าสุด
+	"compatibility_flags": [
+		"nodejs_compat"
+	], //ห้ามแก้
+	"d1_databases": [
+		{
+			"binding": "DB", //ตรงนี้ห้ามแก้ เอาไว้เหมือนเดิม
+			"database_name": "my-emdash-site",
+			"database_id": "bc52c50b-8adb-4501-9faf-a990e4579f48", //ตรงนี้ห้ามแก้ เอาไว้เหมือนเดิม
+		},
+	],
+	"r2_buckets": [
+		{
+			"binding": "MEDIA", //ตรงนี้ห้ามแก้ เอาไว้เหมือนเดิม
+			"bucket_name": "my-emdash-media", //ตรงนี้ห้ามแก้ เอาไว้เหมือนเดิม
+		},
+	],
+	// Sandboxed plugins require Worker Loader, available on Workers paid plans. Uncomment to enable:
+	// "worker_loaders": [{ "binding": "LOADER" }],
+	// General maintenance cron trigger
+	"triggers": {
+		"crons": [
+			"* * * * *"
+		],
+	},
+}

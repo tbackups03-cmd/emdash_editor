@@ -1,0 +1,811 @@
+---
+import { getTaxonomyTermsWithCacheHint } from "emdash";
+import Base from "../../layouts/Base.astro";
+import { getDB } from "../../lib/member-auth";
+import type { BookProduct, MemberGrant } from "../../lib/member-access";
+
+// ตรวจสอบว่าต้องล็อกอินแอดมิน EmDash อยู่เท่านั้น
+const adminUser = (Astro.locals as unknown as { user?: unknown }).user;
+if (!adminUser) {
+	return Astro.redirect("/_emdash/admin");
+}
+
+const categoriesResult = await getTaxonomyTermsWithCacheHint("category");
+const categories = categoriesResult.data ?? [];
+
+const db = getDB();
+
+const productsRows = await db
+	.prepare("SELECT category_slug, title, access_mode, price_thb, preview_paragraphs, stripe_price_id FROM app_book_products")
+	.all<BookProduct>();
+const productMap = new Map<string, BookProduct>();
+for (const p of productsRows.results ?? []) {
+	productMap.set(p.category_slug, p);
+}
+
+interface MemberRow {
+	id: string;
+	email: string;
+	display_name: string;
+	status: string;
+	created_at: string;
+}
+
+const membersRows = await db
+	.prepare("SELECT id, email, display_name, status, created_at FROM app_members ORDER BY created_at DESC")
+	.all<MemberRow>();
+const members = membersRows.results ?? [];
+
+const grantsRows = await db
+	.prepare(
+		`SELECT id, member_id, grant_type, target_slug, source, stripe_ref_id, note, expires_at, created_at
+		 FROM app_member_grants
+		 ORDER BY created_at DESC`,
+	)
+	.all<MemberGrant>();
+const grantsByMember = new Map<string, MemberGrant[]>();
+for (const g of grantsRows.results ?? []) {
+	const arr = grantsByMember.get(g.member_id) ?? [];
+	arr.push(g);
+	grantsByMember.set(g.member_id, arr);
+}
+
+const categoryLabelMap = new Map<string, string>();
+for (const c of categories) {
+	categoryLabelMap.set(c.slug, c.label);
+}
+
+function formatThaiDateTime(iso: string | null): string {
+	if (!iso) return "ตลอดชีพ (ไม่มีวันหมดอายุ)";
+	const d = new Date(iso);
+	if (isNaN(d.getTime())) return iso;
+	return d.toLocaleString("th-TH", {
+		year: "numeric",
+		month: "short",
+		day: "numeric",
+		hour: "2-digit",
+		minute: "2-digit",
+	});
+}
+
+function formatSourceLabel(source: string): string {
+	if (source === "stripe_subscription") return "รายเดือน (Stripe)";
+	if (source === "stripe_onetime") return "ซื้อขาด (Stripe)";
+	return "แอดมินกำหนด";
+}
+---
+
+<Base title="จัดการสมาชิกและสิทธิ์การเข้าถึง" description="ตั้งค่าราคาหนังสือและกำหนดสิทธิ์การเข้าถึงให้สมาชิก">
+	<section class="band section">
+		<div class="frame admin-wrap">
+			<div class="admin-header">
+				<div>
+					<p class="eyebrow">ระบบจัดการหลังบ้าน</p>
+					<h1 class="admin-title">จัดการสมาชิกและสิทธิ์การอ่าน</h1>
+				</div>
+				<a href="/_emdash/admin" class="btn btn--ghost btn--sm">← กลับไปหน้าจัดการบทความ</a>
+			</div>
+			<!-- ตั้งค่าแพ็กเกจสมาชิกรายเดือน (VIP) -->
+			<div class="admin-card">
+				<h2 class="admin-card__title">ตั้งค่าแพ็กเกจสมาชิกรายเดือนแบบเต็มรูปแบบ (อ่านได้ทุกเล่ม)</h2>
+				<p class="admin-card__desc">
+					กำหนดค่าบริการรายเดือนสำหรับสมาชิกที่ต้องการปลดล็อกหนังสือและบทความทั้งหมดในเว็บ
+				</p>
+				<div class="admin-table-wrap">
+					<table class="admin-table">
+						<thead>
+							<tr>
+								<th>ชื่อแพ็กเกจ</th>
+								<th>ค่าบริการรายเดือน (บาท)</th>
+								<th>จัดการ</th>
+							</tr>
+						</thead>
+						<tbody>
+							<tr
+								data-book-row
+								data-slug="__subscription__"
+								data-title="สมาชิกรายเดือนแบบเต็มรูปแบบ"
+							>
+								<td>
+									<strong>สมาชิกรายเดือน (All-Access VIP)</strong>
+									<div class="admin-subtext">หักเงินอัตโนมัติทุกเดือนผ่าน Stripe</div>
+								</td>
+								<td>
+									<input type="hidden" data-field="access_mode" value="free" />
+									<input type="hidden" data-field="preview_paragraphs" value="0" />
+									<input type="hidden" data-field="stripe_price_id" value="" />
+									<input
+										type="number"
+										min="0"
+										step="1"
+										value={productMap.get("__subscription__")?.price_thb ?? 299}
+										class="admin-input admin-input--sm"
+										data-field="price_thb"
+									/>
+								</td>
+								<td>
+									<button type="button" class="btn btn--sm" data-save-book>
+										บันทึก
+									</button>
+								</td>
+							</tr>
+						</tbody>
+					</table>
+				</div>
+			</div>
+			<!-- ส่วนที่ 1: ตั้งค่าหนังสือ / หมวดหมู่ -->
+			<div class="admin-card">
+				<h2 class="admin-card__title">1. ตั้งค่าการล็อกเนื้อหาและราคาหนังสือ (อิงตามหมวดหมู่)</h2>
+				<p class="admin-card__desc">
+					เลือกหมวดหมู่ที่ต้องการเปิดให้<strong>อ่านฟรี</strong> หรือตั้งเป็น<strong>เฉพาะสมาชิก / ซื้อขาด</strong>
+				</p>
+
+				{
+					categories.length === 0 ? (
+						<p class="admin-empty">ยังไม่มีหมวดหมู่ในระบบ กรุณาสร้างหมวดหมู่ใน EmDash Admin ก่อน</p>
+					) : (
+						<div class="admin-table-wrap">
+							<table class="admin-table">
+								<thead>
+									<tr>
+										<th>ชื่อหนังสือ / หมวดหมู่</th>
+										<th>สถานะการเข้าถึง</th>
+										<th>ราคาซื้อขาด (บาท)</th>
+										<th>ตัวอย่างฟรี (ย่อหน้า)</th>
+										<th>จัดการ</th>
+									</tr>
+								</thead>
+								<tbody>
+									{categories.map((cat) => {
+										const saved = productMap.get(cat.slug);
+										const mode = saved?.access_mode ?? "free";
+										const price = saved?.price_thb ?? 0;
+										const previewCount = saved?.preview_paragraphs ?? 2;
+										return (
+											<tr data-book-row data-slug={cat.slug} data-title={cat.label}>
+												<td>
+													<strong>{cat.label}</strong>
+													<div class="admin-subtext">slug: {cat.slug}</div>
+												</td>
+												<td>
+													<select class="admin-input" data-field="access_mode">
+														<option value="free" selected={mode === "free"}>
+															อ่านฟรีทุกคน
+														</option>
+														<option value="paid" selected={mode === "paid"}>
+															ล็อกเนื้อหา (ต้องมีสิทธิ์)
+														</option>
+													</select>
+												</td>
+												<td>
+													<input
+														type="number"
+														min="0"
+														step="1"
+														value={price}
+														class="admin-input admin-input--sm"
+														data-field="price_thb"
+													/>
+												</td>
+												<td>
+													<input
+														type="number"
+														min="0"
+														step="1"
+														value={previewCount}
+														class="admin-input admin-input--sm"
+														data-field="preview_paragraphs"
+													/>
+													<input type="hidden" value="" data-field="stripe_price_id" />
+												</td>
+												<td>
+													<button type="button" class="btn btn--sm" data-save-book>
+														บันทึก
+													</button>
+												</td>
+											</tr>
+										);
+									})}
+								</tbody>
+							</table>
+						</div>
+					)
+				}
+			</div>
+
+			<!-- ส่วนที่ 2: กำหนดสิทธิ์อิสระให้สมาชิก (รูปแบบที่ 3) -->
+			<div class="admin-card">
+				<h2 class="admin-card__title">2. กำหนดสิทธิ์ให้สมาชิกอย่างอิสระ (เช่น อ่านฟรีชั่วคราว / แจกสิทธิ์รายเล่ม)</h2>
+				<p class="admin-card__desc">
+					สามารถเลือกสมาชิก กำหนดหนังสือ หรือเปิดสิทธิ์ VIP ทุกเล่ม พร้อมกำหนดวันหมดอายุได้อย่างอิสระ
+				</p>
+
+				{
+					members.length === 0 ? (
+						<p class="admin-empty">ยังไม่มีสมาชิกสมัครเข้ามาในระบบ</p>
+					) : (
+						<form id="grant-form" class="grant-grid">
+							<div class="grant-field">
+								<label for="grant-member">เลือกสมาชิก</label>
+								<select id="grant-member" name="member_id" class="admin-input" required>
+									{members.map((m) => (
+										<option value={m.id}>
+											{m.display_name} ({m.email})
+										</option>
+									))}
+								</select>
+							</div>
+
+							<div class="grant-field">
+								<label for="grant-type">ประเภทสิทธิ์</label>
+								<select id="grant-type" name="grant_type" class="admin-input">
+									<option value="book">อ่านเฉพาะหนังสือที่เลือก</option>
+									<option value="all_access">VIP อ่านได้ทุกเล่มไม่จำกัด</option>
+								</select>
+							</div>
+
+							<div class="grant-field" id="grant-book-wrap">
+								<label for="grant-target">เลือกหนังสือ / หมวดหมู่</label>
+								<select id="grant-target" name="target_slug" class="admin-input">
+									{categories.map((cat) => (
+										<option value={cat.slug}>{cat.label}</option>
+									))}
+								</select>
+							</div>
+
+							<div class="grant-field">
+								<label for="grant-duration">ระยะเวลาสิทธิ์</label>
+								<select id="grant-duration" class="admin-input">
+									<option value="lifetime">ตลอดชีพ (ไม่มีวันหมดอายุ)</option>
+									<option value="7d">ฟรี 7 วัน</option>
+									<option value="30d">ฟรี 30 วัน</option>
+									<option value="custom">กำหนดวันและเวลาเอง...</option>
+								</select>
+							</div>
+
+							<div class="grant-field" id="grant-custom-date-wrap" hidden>
+								<label for="grant-custom-date">วันและเวลาหมดอายุ</label>
+								<input
+									id="grant-custom-date"
+									type="datetime-local"
+									class="admin-input"
+								/>
+							</div>
+
+							<div class="grant-field">
+								<label for="grant-note">หมายเหตุ (ไม่บังคับ)</label>
+								<input
+									id="grant-note"
+									name="note"
+									type="text"
+									placeholder="เช่น ลูกค้าโอนตรง / ทดลองอ่าน"
+									class="admin-input"
+								/>
+							</div>
+
+							<div class="grant-actions">
+								<button type="submit" class="btn">
+									+ มอบสิทธิ์ให้สมาชิก
+								</button>
+							</div>
+						</form>
+					)
+				}
+			</div>
+
+			<!-- ส่วนที่ 3: รายชื่อสมาชิกทั้งหมด -->
+			<div class="admin-card">
+				<h2 class="admin-card__title">3. รายชื่อสมาชิกทั้งหมด ({members.length} คน)</h2>
+
+				{
+					members.length === 0 ? (
+						<p class="admin-empty">ยังไม่มีข้อมูลสมาชิก</p>
+					) : (
+						<div class="member-list">
+							{members.map((m) => {
+								const userGrants = grantsByMember.get(m.id) ?? [];
+								return (
+									<div class="member-item">
+										<div class="member-item__top">
+											<div>
+												<strong>{m.display_name}</strong>{" "}
+												<span class={`badge ${m.status === "active" ? "badge--ok" : "badge--warn"}`}>
+													{m.status === "active" ? "ใช้งานปกติ" : "ถูกระงับ"}
+												</span>
+												<div class="admin-subtext">{m.email}</div>
+											</div>
+											<div style="display: flex; flex-wrap: wrap; gap: 6px;">
+												<button
+													type="button"
+													class="btn btn--ghost btn--sm"
+													data-admin-reset-pw
+													data-member-id={m.id}
+													data-member-name={m.display_name}
+												>
+													รีเซ็ตรหัสผ่าน
+												</button>
+												<button
+													type="button"
+													class="btn btn--ghost btn--sm"
+													data-toggle-status
+													data-member-id={m.id}
+													data-next-status={m.status === "active" ? "suspended" : "active"}
+												>
+													{m.status === "active" ? "ระงับบัญชี" : "เปิดใช้งานบัญชี"}
+												</button>
+											</div>
+										</div>
+
+										<div class="member-item__grants">
+											<p class="admin-subtext" style="margin-bottom: 6px;">
+												สิทธิ์การเข้าถึงที่มีอยู่:
+											</p>
+											{userGrants.length === 0 ? (
+												<span class="admin-subtext">— ยังไม่มีสิทธิ์พิเศษ (อ่านได้เฉพาะบทความฟรี)</span>
+											) : (
+												<ul class="grant-badge-list">
+													{userGrants.map((g) => {
+														const isExpired = g.expires_at ? new Date(g.expires_at) <= new Date() : false;
+														const targetName =
+															g.grant_type === "all_access"
+																? "ทุกเล่มไม่จำกัด (VIP)"
+																: categoryLabelMap.get(g.target_slug) || g.target_slug;
+														return (
+															<li class={`grant-pill ${isExpired ? "grant-pill--expired" : ""}`}>
+																<div>
+																	<strong>{targetName}</strong>
+																	<span class="grant-pill__meta">
+																		{" "}• {formatSourceLabel(g.source)} •{" "}
+																		{isExpired ? "หมดอายุแล้ว" : formatThaiDateTime(g.expires_at)}
+																		{g.note ? ` (${g.note})` : ""}
+																	</span>
+																</div>
+																<button
+																	type="button"
+																	class="grant-pill__del"
+																	data-delete-grant={g.id}
+																	title="ยกเลิกสิทธิ์นี้"
+																>
+																	ยกเลิก
+																</button>
+															</li>
+														);
+													})}
+												</ul>
+											)}
+										</div>
+									</div>
+								);
+							})}
+						</div>
+					)
+				}
+			</div>
+		</div>
+	</section>
+</Base>
+
+<script>
+	// 1. บันทึกการตั้งค่าหนังสือ/หมวดหมู่
+	document.querySelectorAll<HTMLButtonElement>("[data-save-book]").forEach((btn) => {
+		btn.addEventListener("click", async () => {
+			const row = btn.closest<HTMLElement>("[data-book-row]");
+			if (!row) return;
+
+			const accessModeEl = row.querySelector<HTMLSelectElement | HTMLInputElement>('[data-field="access_mode"]');
+			const priceEl = row.querySelector<HTMLInputElement>('[data-field="price_thb"]');
+			const previewEl = row.querySelector<HTMLInputElement>('[data-field="preview_paragraphs"]');
+			const stripeEl = row.querySelector<HTMLInputElement>('[data-field="stripe_price_id"]');
+
+			const originalText = btn.textContent;
+			btn.disabled = true;
+			btn.textContent = "กำลังบันทึก...";
+
+			try {
+				const res = await fetch("/api/admin/books", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({
+						category_slug: row.dataset.slug,
+						title: row.dataset.title,
+						access_mode: accessModeEl?.value ?? "free",
+						price_thb: Number(priceEl?.value ?? 0),
+						preview_paragraphs: Number(previewEl?.value ?? 2),
+						stripe_price_id: stripeEl?.value ?? "",
+					}),
+				});
+				if (!res.ok) {
+					const data = (await res.json()) as Record<string, unknown>;
+					alert(String(data.error || "บันทึกไม่สำเร็จ"));
+				} else {
+					btn.textContent = "บันทึกแล้ว ✓";
+					setTimeout(() => {
+						btn.textContent = originalText;
+					}, 1500);
+				}
+			} catch {
+				alert("เกิดข้อผิดพลาดในการเชื่อมต่อ");
+			} finally {
+				btn.disabled = false;
+			}
+		});
+	});
+
+	// 2. ควบคุมฟอร์มมอบสิทธิ์อิสระ
+	const grantTypeSelect = document.getElementById("grant-type") as HTMLSelectElement | null;
+	const grantBookWrap = document.getElementById("grant-book-wrap");
+	const grantDurationSelect = document.getElementById("grant-duration") as HTMLSelectElement | null;
+	const grantCustomDateWrap = document.getElementById("grant-custom-date-wrap");
+	const grantCustomDateInput = document.getElementById("grant-custom-date") as HTMLInputElement | null;
+	const grantForm = document.getElementById("grant-form") as HTMLFormElement | null;
+
+	grantTypeSelect?.addEventListener("change", () => {
+		if (grantBookWrap) {
+			grantBookWrap.hidden = grantTypeSelect.value === "all_access";
+		}
+	});
+
+	grantDurationSelect?.addEventListener("change", () => {
+		if (grantCustomDateWrap) {
+			grantCustomDateWrap.hidden = grantDurationSelect.value !== "custom";
+		}
+	});
+
+	grantForm?.addEventListener("submit", async (e) => {
+		e.preventDefault();
+		const formData = new FormData(grantForm);
+		const duration = grantDurationSelect?.value ?? "lifetime";
+
+		let expiresAt = "";
+		if (duration === "7d") {
+			expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+		} else if (duration === "30d") {
+			expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+		} else if (duration === "custom" && grantCustomDateInput?.value) {
+			expiresAt = new Date(grantCustomDateInput.value).toISOString();
+		}
+
+		try {
+			const res = await fetch("/api/admin/grants", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					member_id: formData.get("member_id"),
+					grant_type: formData.get("grant_type"),
+					target_slug: formData.get("target_slug"),
+					expires_at: expiresAt,
+					note: formData.get("note"),
+				}),
+			});
+			const data = (await res.json()) as Record<string, unknown>;
+			if (!res.ok) {
+				alert(String(data.error || "มอบสิทธิ์ไม่สำเร็จ"));
+				return;
+			}
+			window.location.reload();
+		} catch {
+			alert("ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ได้");
+		}
+	});
+
+	// 3. ยกเลิกสิทธิ์รายรายการ
+	document.querySelectorAll<HTMLButtonElement>("[data-delete-grant]").forEach((btn) => {
+		btn.addEventListener("click", async () => {
+			if (!confirm("ต้องการยกเลิกสิทธิ์นี้ใช่หรือไม่?")) return;
+			const grantId = btn.dataset.deleteGrant;
+			try {
+				const res = await fetch("/api/admin/grants", {
+					method: "DELETE",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ grant_id: grantId }),
+				});
+				if (res.ok) window.location.reload();
+			} catch {
+				alert("ยกเลิกสิทธิ์ไม่สำเร็จ");
+			}
+		});
+	});
+
+	// 4. ระงับหรือเปิดใช้งานบัญชีสมาชิก
+	document.querySelectorAll<HTMLButtonElement>("[data-toggle-status]").forEach((btn) => {
+		btn.addEventListener("click", async () => {
+			const memberId = btn.dataset.memberId;
+			const nextStatus = btn.dataset.nextStatus;
+			try {
+				const res = await fetch("/api/admin/member-status", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ member_id: memberId, status: nextStatus }),
+				});
+				if (res.ok) window.location.reload();
+			} catch {
+				alert("เปลี่ยนสถานะไม่สำเร็จ");
+			}
+		});
+	});
+	// 5. แอดมินตั้งรหัสผ่านใหม่ให้สมาชิกโดยตรง
+	document.querySelectorAll<HTMLButtonElement>("[data-admin-reset-pw]").forEach((btn) => {
+		btn.addEventListener("click", async () => {
+			const memberId = btn.dataset.memberId;
+			const memberName = btn.dataset.memberName || "สมาชิก";
+			const newPassword = prompt(`ตั้งรหัสผ่านใหม่ให้ "${memberName}" (อย่างน้อย 6 ตัวอักษร):`);
+			if (!newPassword) return;
+			if (newPassword.length < 6) {
+				alert("รหัสผ่านใหม่ต้องมีอย่างน้อย 6 ตัวอักษร");
+				return;
+			}
+
+			try {
+				const res = await fetch("/api/admin/reset-password", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({
+						member_id: memberId,
+						new_password: newPassword,
+					}),
+				});
+				const data = (await res.json()) as Record<string, unknown>;
+				if (!res.ok) {
+					alert(String(data.error || "ตั้งรหัสผ่านใหม่ไม่สำเร็จ"));
+					return;
+				}
+				alert(`เปลี่ยนรหัสผ่านให้ "${memberName}" เรียบร้อยแล้ว`);
+			} catch {
+				alert("เกิดข้อผิดพลาดในการเชื่อมต่อเซิร์ฟเวอร์");
+			}
+		});
+	});
+</script>
+
+<style>
+	.admin-wrap {
+		width: 100%;
+		max-width: 100%;
+		min-width: 0;
+		display: grid;
+		grid-template-columns: minmax(0, 1fr);
+		gap: var(--spacing-6);
+	}
+
+	.admin-header {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--spacing-4);
+		min-width: 0;
+	}
+
+	.admin-title {
+		margin-top: var(--spacing-1);
+		font-size: clamp(1.35rem, 1.1rem + 1.2vw, var(--font-size-2xl));
+		overflow-wrap: break-word;
+	}
+
+	.admin-card {
+		width: 100%;
+		max-width: 100%;
+		min-width: 0;
+		box-sizing: border-box;
+		padding: clamp(1rem, 3vw, 1.75rem);
+		border: 1px solid var(--color-border);
+		border-radius: 16px;
+		background: var(--color-surface);
+	}
+
+	.admin-card__title {
+		font-size: var(--font-size-lg);
+		overflow-wrap: break-word;
+	}
+
+	.admin-card__desc {
+		margin-top: 4px;
+		font-size: var(--font-size-sm);
+		color: var(--color-text-secondary);
+		overflow-wrap: break-word;
+	}
+
+	.admin-subtext {
+		font-size: var(--font-size-xs);
+		color: var(--color-muted);
+		overflow-wrap: anywhere;
+	}
+
+	.admin-empty {
+		margin-top: var(--spacing-4);
+		font-size: var(--font-size-sm);
+		color: var(--color-muted);
+	}
+
+	.admin-table-wrap {
+		width: 100%;
+		max-width: 100%;
+		min-width: 0;
+		margin-top: var(--spacing-4);
+		overflow-x: auto;
+		-webkit-overflow-scrolling: touch;
+	}
+
+	.admin-table {
+		width: 100%;
+		border-collapse: collapse;
+		font-size: var(--font-size-sm);
+	}
+
+	.admin-table th,
+	.admin-table td {
+		padding: 10px 12px;
+		border-bottom: 1px solid var(--color-border);
+		text-align: left;
+		vertical-align: middle;
+	}
+
+	.admin-input {
+		width: 100%;
+		max-width: 100%;
+		min-width: 0;
+		box-sizing: border-box;
+		height: 2.25rem;
+		padding-inline: 10px;
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius);
+		background: var(--color-bg);
+		color: var(--color-text);
+		font: inherit;
+		font-size: var(--font-size-sm);
+	}
+
+	.admin-table .admin-input {
+		min-width: 130px;
+	}
+
+	.admin-input--sm,
+	.admin-table .admin-input--sm {
+		min-width: 85px;
+		max-width: 110px;
+	}
+
+	.grant-grid {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr);
+		gap: var(--spacing-4);
+		margin-top: var(--spacing-4);
+		min-width: 0;
+	}
+
+	@media (min-width: 640px) {
+		.grant-grid {
+			grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+		}
+	}
+
+	.grant-field {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr);
+		gap: 6px;
+		min-width: 0;
+		max-width: 100%;
+	}
+
+	.grant-field label {
+		font-size: var(--font-size-xs);
+		font-weight: 500;
+		color: var(--color-text-secondary);
+	}
+
+	.grant-actions {
+		display: flex;
+		align-items: flex-end;
+		min-width: 0;
+	}
+
+	.member-list {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr);
+		gap: var(--spacing-4);
+		margin-top: var(--spacing-4);
+		min-width: 0;
+	}
+
+	.member-item {
+		width: 100%;
+		max-width: 100%;
+		min-width: 0;
+		box-sizing: border-box;
+		padding: var(--spacing-4);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius);
+		background: var(--color-bg);
+	}
+
+	.member-item__top {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--spacing-3);
+		min-width: 0;
+	}
+
+	.member-item__top > div {
+		flex: 1 1 200px;
+		min-width: 0;
+		overflow-wrap: anywhere;
+	}
+
+	.member-item__grants {
+		margin-top: var(--spacing-3);
+		padding-top: var(--spacing-3);
+		border-top: 1px dashed var(--color-border);
+		min-width: 0;
+	}
+
+	.badge {
+		display: inline-block;
+		padding: 2px 8px;
+		border-radius: var(--radius-full);
+		font-size: 11px;
+		font-weight: 500;
+	}
+
+	.badge--ok {
+		background: rgb(22 163 74 / 0.15);
+		color: #16a34a;
+	}
+
+	.badge--warn {
+		background: rgb(220 38 38 / 0.15);
+		color: #ef4444;
+	}
+
+	.grant-badge-list {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr);
+		gap: 6px;
+		list-style: none;
+		padding: 0;
+		min-width: 0;
+	}
+
+	.grant-pill {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--spacing-2);
+		width: 100%;
+		max-width: 100%;
+		min-width: 0;
+		box-sizing: border-box;
+		padding: 8px 12px;
+		border-radius: var(--radius);
+		background: var(--color-surface);
+		border: 1px solid var(--color-border);
+		font-size: var(--font-size-xs);
+		overflow-wrap: anywhere;
+	}
+
+	.grant-pill > div {
+		flex: 1 1 200px;
+		min-width: 0;
+	}
+
+	.grant-pill--expired {
+		opacity: 0.6;
+	}
+
+	.grant-pill__meta {
+		color: var(--color-text-secondary);
+	}
+
+	.grant-pill__del {
+		flex-shrink: 0;
+		border: 0;
+		background: transparent;
+		color: #ef4444;
+		font: inherit;
+		font-size: var(--font-size-xs);
+		cursor: pointer;
+		text-decoration: underline;
+	}
+</style>
